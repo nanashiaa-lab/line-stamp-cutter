@@ -7,7 +7,9 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-py -3 -m PyInstaller --clean --onefile --windowed --name LINEStampCutter --collect-all PIL line_stamp_cutter.py
+py -3 -c "import PIL; print('Bundled Pillow will be:', PIL.__version__)"
+REM v1.0.1: dropped --collect-all PIL (it dragged in unused numpy) and exclude numpy explicitly.
+py -3 -m PyInstaller --clean --onefile --windowed --name LINEStampCutter --exclude-module numpy line_stamp_cutter.py
 if errorlevel 1 (
   echo Build failed. See the PyInstaller output above.
   pause

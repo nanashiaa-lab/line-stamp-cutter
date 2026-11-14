@@ -1,12 +1,315 @@
+import os
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from collections import Counter
-from PIL import Image, ImageChops, ImageDraw, ImageTk
 from statistics import median
 from zipfile import ZIP_DEFLATED, ZipFile
 
 APP_TITLE = "LINEスタンプ画像カッター"
+APP_VERSION = "1.0.1"
+# この版のEXEに同梱した Pillow の版。requirements.txt を変えたら、ここも合わせること
+BUNDLED_PILLOW_VERSION = "13.0.0"
+
+UPDATE_API_URL = "https://api.github.com/repos/nanashiaa-lab/line-stamp-cutter/releases/latest"
+UPDATE_RELEASES_URL = "https://github.com/nanashiaa-lab/line-stamp-cutter/releases"
+PILLOW_API_URL = "https://pypi.org/pypi/Pillow/json"
+
+
+def _version_tuple(text):
+    """'v1.2.3' のような文字列を (1, 2, 3) に変換します。数字でない部分は0として扱います。"""
+    cleaned = str(text).strip().lstrip("vV")
+    parts = []
+    for piece in cleaned.split("."):
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _pillow_data_dir():
+    """「更新を確認」でダウンロードした Pillow の保存先フォルダです。"""
+    base = (
+        os.environ.get("LOCALAPPDATA")
+        or os.environ.get("XDG_DATA_HOME")
+        or os.path.join(os.path.expanduser("~"), ".local", "share")
+    )
+    return Path(base) / "LINEStampCutter" / "pillow"
+
+
+def _downloaded_pillow_version(directory):
+    """保存先フォルダ内の pillow-<版>.dist-info から、ダウンロード済み Pillow の版を読みます。"""
+    try:
+        for child in Path(directory).iterdir():
+            name = child.name
+            if name.lower().startswith("pillow-") and name.lower().endswith(".dist-info"):
+                return name[len("pillow-") : -len(".dist-info")]
+    except OSError:
+        pass
+    return ""
+
+
+def _prefer_downloaded_pillow():
+    """ダウンロード済みの Pillow が同梱版より新しければ、そちらを先に読み込むようにします。
+
+    ネットワークには一切アクセスしません（保存済みフォルダを見るだけ）。
+    """
+    try:
+        directory = _pillow_data_dir()
+        if not (directory / "PIL").is_dir():
+            return False
+        version = _downloaded_pillow_version(directory)
+        if version and _version_tuple(version) > _version_tuple(BUNDLED_PILLOW_VERSION):
+            sys.path.insert(0, str(directory))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+_PILLOW_FROM_DOWNLOAD = _prefer_downloaded_pillow()
+
+try:
+    from PIL import Image, ImageChops, ImageDraw, ImageTk
+except Exception:
+    if not _PILLOW_FROM_DOWNLOAD:
+        raise
+    # ダウンロードした Pillow が壊れていた場合は、それを外して同梱版で起動し直します
+    try:
+        sys.path.remove(str(_pillow_data_dir()))
+    except ValueError:
+        pass
+    for _name in [m for m in sys.modules if m == "PIL" or m.startswith("PIL.")]:
+        del sys.modules[_name]
+    from PIL import Image, ImageChops, ImageDraw, ImageTk
+
+    _PILLOW_FROM_DOWNLOAD = False
+
+
+def fetch_latest_release(api_url=UPDATE_API_URL, timeout=5):
+    """GitHubの最新リリース情報を取得し、(版数, リリースページURL) を返します。
+
+    送るのは「最新版は何か」という問い合わせだけで、画像や利用者の情報は一切送りません。
+    """
+    import json
+    import urllib.request
+
+    request = urllib.request.Request(
+        api_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"LINEStampCutter/{APP_VERSION}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return str(data.get("tag_name", "")), str(data.get("html_url", UPDATE_RELEASES_URL))
+
+
+def check_for_update(current_version=APP_VERSION, api_url=UPDATE_API_URL):
+    """更新の有無を調べます。
+
+    戻り値: (状態, 最新版, リリースページURL)
+    状態は "update"（新しい版あり）/ "latest"（同じ）/ "ahead"（手元の方が新しい）/ "error"（取得失敗）
+    """
+    try:
+        latest, url = fetch_latest_release(api_url=api_url)
+    except Exception:
+        return "error", "", UPDATE_RELEASES_URL
+    if not latest:
+        return "error", "", UPDATE_RELEASES_URL
+    current_tuple = _version_tuple(current_version)
+    latest_tuple = _version_tuple(latest)
+    if latest_tuple > current_tuple:
+        return "update", latest, url
+    if latest_tuple < current_tuple:
+        return "ahead", latest, url
+    return "latest", latest, url
+
+
+def fetch_latest_pillow_version(api_url=PILLOW_API_URL, timeout=5):
+    """PyPIでPillowの最新版を取得します。送るのは版数の問い合わせだけです。"""
+    import json
+    import urllib.request
+
+    request = urllib.request.Request(
+        api_url,
+        headers={"User-Agent": f"LINEStampCutter/{APP_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return str(data.get("info", {}).get("version", ""))
+
+
+def check_components(bundled_pillow=None, api_url=PILLOW_API_URL):
+    """同梱している部品に新しい版が出ているかを調べます。
+
+    戻り値: [(部品名, 同梱の版, 最新版, 状態), ...]
+    状態は "update"（新しい版あり）/ "latest"（最新）/ "error"（取得失敗）
+    """
+    import PIL
+
+    bundled = bundled_pillow if bundled_pillow is not None else PIL.__version__
+    try:
+        latest = fetch_latest_pillow_version(api_url=api_url)
+    except Exception:
+        return [("Pillow", bundled, "", "error")]
+    if not latest:
+        return [("Pillow", bundled, "", "error")]
+    if _version_tuple(latest) > _version_tuple(bundled):
+        state = "update"
+    else:
+        state = "latest"
+    return [("Pillow", bundled, latest, state)]
+
+
+def _wheel_py_tag():
+    """実行中の Python に対応する wheel のタグ（例: cp312）です。"""
+    return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _platform_key():
+    """実行中の OS に対応する wheel 選択用のキーです。"""
+    import sysconfig
+
+    plat = sysconfig.get_platform().lower()
+    if plat.startswith("win"):
+        return "win_amd64" if "amd64" in plat else "win32"
+    if plat.startswith("linux"):
+        return "manylinux"
+    if plat.startswith("macosx"):
+        return "macosx"
+    return plat
+
+
+def pick_pillow_wheel(urls, py_tag=None, platform_key=None):
+    """PyPI のファイル一覧から、この環境で使える Pillow の wheel を1つ選びます。
+
+    OS・CPU・Python の版が完全一致するものだけを対象にします（合わないものは読み込めません）。
+    """
+    import platform as _platform
+
+    py_tag = py_tag or _wheel_py_tag()
+    platform_key = platform_key or _platform_key()
+    machine = _platform.machine().lower()
+    for entry in urls:
+        name = entry.get("filename", "")
+        if not name.endswith(".whl"):
+            continue
+        parts = name[: -len(".whl")].split("-")
+        if len(parts) < 5:
+            continue
+        impl, abi, plat = parts[-3], parts[-2], parts[-1]
+        if impl != py_tag or abi != py_tag:
+            continue
+        if platform_key == "manylinux":
+            if "manylinux" not in plat and "linux" not in plat:
+                continue
+            if machine and machine not in plat:
+                continue
+        elif platform_key not in plat:
+            continue
+        return entry
+    return None
+
+
+def _safe_extract(zf, target_dir):
+    """ZIP を展開します。フォルダの外へ書き出すような項目があれば失敗にします。"""
+    target = Path(target_dir).resolve()
+    for info in zf.infolist():
+        out = (target / info.filename).resolve()
+        if out != target and target not in out.parents:
+            raise RuntimeError("不正なファイルが含まれています")
+        if info.is_dir():
+            out.mkdir(parents=True, exist_ok=True)
+        else:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(zf.read(info))
+
+
+def download_latest_pillow(api_url=PILLOW_API_URL, dest_dir=None, py_tag=None, platform_key=None, timeout=60):
+    """最新版の Pillow をダウンロードし、ユーザーフォルダに展開します。
+
+    戻り値は展開した Pillow の版。PyPI が公表している SHA256 と一致しない場合は失敗にします。
+    展開に成功するまでは、今ある保存先には触りません。
+    """
+    import hashlib
+    import io
+    import json
+    import shutil
+    import urllib.request
+    import zipfile
+
+    request = urllib.request.Request(api_url, headers={"User-Agent": f"LINEStampCutter/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    version = str(data.get("info", {}).get("version", ""))
+    wheel = pick_pillow_wheel(data.get("urls", []), py_tag=py_tag, platform_key=platform_key)
+    if not version or wheel is None:
+        raise RuntimeError("この環境に合う Pillow が見つかりませんでした")
+
+    request = urllib.request.Request(wheel["url"], headers={"User-Agent": f"LINEStampCutter/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        blob = response.read()
+    if hashlib.sha256(blob).hexdigest() != wheel.get("digests", {}).get("sha256"):
+        raise RuntimeError("ダウンロードしたファイルの検証に失敗しました")
+
+    dest = Path(dest_dir) if dest_dir is not None else _pillow_data_dir()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest.parent / "pillow-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            _safe_extract(zf, staging)
+        native = list((staging / "PIL").glob("_imaging*.pyd")) + list((staging / "PIL").glob("_imaging*.so"))
+        if not (staging / "PIL").is_dir() or not native or _downloaded_pillow_version(staging) != version:
+            raise RuntimeError("展開した Pillow の中身が正しくありません")
+        backup = dest.parent / "pillow-backup"
+        if backup.exists():
+            shutil.rmtree(backup)
+        if dest.exists():
+            dest.rename(backup)
+        try:
+            staging.rename(dest)
+        except Exception:
+            if backup.exists() and not dest.exists():
+                backup.rename(dest)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return version
+
+
+def _update_summary_lines(app_result, component_results):
+    """更新確認の結果を、ダイアログ表示用の行のリストにまとめます。"""
+    status, latest, _url = app_result
+    if status == "update":
+        lines = [f"アプリ: 新しいバージョン {latest} が公開されています（現在 v{APP_VERSION}）"]
+    elif status == "latest":
+        lines = [f"アプリ: 最新です（v{APP_VERSION}）"]
+    elif status == "ahead":
+        lines = [f"アプリ: 公開中の最新版（{latest}）より新しい版です（v{APP_VERSION}）"]
+    else:
+        lines = ["アプリ: 更新情報を取得できませんでした"]
+    for name, bundled, comp_latest, comp_state in component_results:
+        if comp_state == "update":
+            lines.append(f"{name}: 使用中 {bundled} → 最新 {comp_latest}（新しい版が出ています）")
+        elif comp_state == "latest":
+            lines.append(f"{name}: 使用中 {bundled}（最新です）")
+        else:
+            lines.append(f"{name}: 使用中 {bundled}（最新版を取得できませんでした）")
+    return lines
+
 
 class StampCutter:
     def __init__(self, root):
@@ -22,7 +325,11 @@ class StampCutter:
         self.boxes = []
         self.active_box = 0
         self.drag_target = None
-        self.drag_mode = tk.StringVar(value="single")
+        self._undo_stack = []
+        self._layout_settings = None
+        self._boxes_customized = False
+        self._layout_after_id = None
+        self._last_key_push = 0.0
         self.selected_number = tk.StringVar(value="1")
         self.edge_var = tk.StringVar(value="左辺")
         self.step_var = tk.StringVar(value="1")
@@ -33,6 +340,8 @@ class StampCutter:
         ttk.Button(top, text="画像を開く…", command=self.open_image).pack(side="left")
         self.file_label = ttk.Label(top, text="PNG画像を選択してください")
         self.file_label.pack(side="left", padx=10)
+        self.update_button = ttk.Button(top, text="更新を確認", command=self.check_update_clicked)
+        self.update_button.pack(side="right")
 
         controls = ttk.LabelFrame(root, text="分割設定", padding=10)
         controls.pack(fill="x", padx=12)
@@ -49,14 +358,11 @@ class StampCutter:
         ttk.Button(controls, text="均等配置に戻す", command=self.reset_layout).grid(row=0, column=5, padx=(8, 0), pady=(16, 0))
         ttk.Button(controls, text="背景を判定してフィット", command=self.auto_fit).grid(row=0, column=6, padx=(8, 0), pady=(16, 0))
         for var in (self.rows, self.cols, self.margin, self.gap):
-            var.trace_add("write", lambda *_: self.reset_layout())
+            var.trace_add("write", lambda *_: self._schedule_layout_apply())
 
         modebar = ttk.Frame(root, padding=(14, 6, 14, 2))
         modebar.pack(fill="x")
-        ttk.Label(modebar, text="ドラッグ:").pack(side="left")
-        ttk.Radiobutton(modebar, text="選んだコマだけ", variable=self.drag_mode, value="single").pack(side="left", padx=(6, 4))
-        ttk.Radiobutton(modebar, text="全コマをまとめて", variable=self.drag_mode, value="all").pack(side="left", padx=4)
-        ttk.Label(modebar, text="（コマ内をクリックして選択）").pack(side="left", padx=4)
+        ttk.Label(modebar, text="コマ内をクリックして選択／枠線をドラッグで移動（Shift同時押しで全コマ移動）／矢印キーで選択コマを移動（Shift同時押しで10倍）").pack(side="left")
 
         fine = ttk.LabelFrame(root, text="ボタンで微調整", padding=(10, 6))
         fine.pack(fill="x", padx=12, pady=(2, 4))
@@ -68,11 +374,15 @@ class StampCutter:
         ttk.Label(fine, text="動かす辺").pack(side="left")
         self.edge_box = ttk.Combobox(fine, textvariable=self.edge_var, values=("左辺", "右辺", "上辺", "下辺"), state="readonly", width=7)
         self.edge_box.pack(side="left", padx=(4, 12))
+        self.edge_box.bind("<<ComboboxSelected>>", lambda _e: self.redraw())
         ttk.Label(fine, text="移動量(px)").pack(side="left")
         self.step_spin = ttk.Spinbox(fine, from_=1, to=100, textvariable=self.step_var, width=5)
         self.step_spin.pack(side="left", padx=(4, 5))
         ttk.Button(fine, text="−", width=3, command=lambda: self.nudge_edge(-1)).pack(side="left", padx=2)
         ttk.Button(fine, text="＋", width=3, command=lambda: self.nudge_edge(1)).pack(side="left", padx=2)
+        ttk.Label(fine, text="（＋:広げる −:縮める）").pack(side="left", padx=(2, 0))
+        self.selected_info = ttk.Label(fine, text="", font=("Segoe UI", 10, "bold"))
+        self.selected_info.pack(side="left", padx=(14, 0))
         ttk.Label(fine, text="表示倍率").pack(side="left", padx=(18, 0))
         self.zoom_box = ttk.Combobox(fine, textvariable=self.zoom_var, values=("100%", "150%", "200%", "300%", "400%"), state="readonly", width=7)
         self.zoom_box.pack(side="left", padx=5)
@@ -101,11 +411,16 @@ class StampCutter:
         self.canvas.bind("<B1-Motion>", self.drag_line)
         self.canvas.bind("<ButtonRelease-1>", lambda _e: setattr(self, "drag_target", None))
         self.canvas.bind("<MouseWheel>", self._mousewheel)
+        for _key in ("<Left>", "<Right>", "<Up>", "<Down>"):
+            self.root.bind_all(_key, self._on_arrow_key)
+        self.root.bind_all("<Control-z>", lambda _e: self.undo())
+        self.root.bind_all("<Control-Z>", lambda _e: self.undo())
 
         bottom = ttk.Frame(root, padding=12)
         bottom.pack(fill="x")
         ttk.Label(bottom, text="各コマの枠線は独立しています。ボタンは選択中のコマの辺を移動します。").pack(side="left")
         ttk.Button(bottom, text="切り出して保存…", command=self.export).pack(side="right")
+        ttk.Button(bottom, text="元に戻す（Ctrl+Z）", command=self.undo).pack(side="right", padx=(0, 8))
 
     def _field(self, parent, label, var, col):
         group = ttk.Frame(parent)
@@ -126,6 +441,101 @@ class StampCutter:
                 raise ValueError("設定した余白・間隔が画像サイズに対して大きすぎます。")
         return rows, cols, margin, gap
 
+    def _push_undo(self, coalesce=False):
+        """操作前の枠の状態を「元に戻す」用に保存します。"""
+        import time
+
+        if not self.boxes:
+            return
+        now = time.monotonic()
+        if coalesce and self._undo_stack and now - self._last_key_push < 0.8:
+            return
+        self._last_key_push = now
+        self._undo_stack.append((self._layout_settings, [list(b) for b in self.boxes]))
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+
+    def undo(self):
+        """直前の操作（ドラッグ・微調整・自動フィット・レイアウトのリセット等）を取り消します。"""
+        if not self._undo_stack:
+            return
+        settings, boxes = self._undo_stack.pop()
+        if settings is not None and settings != self._layout_settings:
+            rows, cols, margin, gap = settings
+            self.rows.set(str(rows))
+            self.cols.set(str(cols))
+            self.margin.set(str(margin))
+            self.gap.set(str(gap))
+            self._layout_settings = settings
+        self.boxes = [list(b) for b in boxes]
+        if self.active_box >= len(self.boxes):
+            self.active_box = max(0, len(self.boxes) - 1)
+            self.selected_number.set(str(self.active_box + 1))
+        self._boxes_customized = True
+        self.redraw()
+
+    def _schedule_layout_apply(self):
+        """設定の変更を即座には反映せず、入力が落ち着いてからまとめて反映します。"""
+        if self._layout_after_id is not None:
+            try:
+                self.root.after_cancel(self._layout_after_id)
+            except Exception:
+                pass
+        self._layout_after_id = self.root.after(450, self._apply_layout_settings)
+
+    def _apply_layout_settings(self):
+        self._layout_after_id = None
+        if self.image is None:
+            return
+        try:
+            settings = self._settings()
+        except (ValueError, tk.TclError):
+            return
+        if settings == self._layout_settings:
+            return
+        if self._boxes_customized and self.boxes and self._layout_settings is not None:
+            if not messagebox.askyesno(
+                "レイアウトのリセット確認",
+                "設定を変えると、手動で調整した枠が均等配置に戻ります。\n続けますか？",
+            ):
+                rows, cols, margin, gap = self._layout_settings
+                self.rows.set(str(rows))
+                self.cols.set(str(cols))
+                self.margin.set(str(margin))
+                self.gap.set(str(gap))
+                return
+        self.reset_layout()
+
+    def _on_arrow_key(self, event):
+        """矢印キーで選択中のコマを移動します（入力欄にフォーカスがあるときはそちらを優先）。"""
+        if event.widget.winfo_class() in ("TSpinbox", "Spinbox", "TCombobox", "TEntry", "Entry", "Text"):
+            return
+        if self.image is None or not self.boxes:
+            return "break"
+        try:
+            step = max(1, int(self.step_var.get()))
+        except ValueError:
+            return "break"
+        if event.state & 0x0001:  # Shift同時押しで10倍
+            step *= 10
+        dx = {"Left": -step, "Right": step}.get(event.keysym, 0)
+        dy = {"Up": -step, "Down": step}.get(event.keysym, 0)
+        if dx == 0 and dy == 0:
+            return
+        self._push_undo(coalesce=True)
+        box = self.boxes[self.active_box]
+        width, height = self.image.size
+        dx = max(-box[0], min(dx, width - box[2]))
+        dy = max(-box[1], min(dy, height - box[3]))
+        if dx or dy:
+            box[0] += dx
+            box[2] += dx
+            box[1] += dy
+            box[3] += dy
+            self._boxes_customized = True
+            self.redraw()
+        return "break"
+
     def _selection_changed(self):
         try:
             index = int(self.selected_number.get()) - 1
@@ -138,6 +548,8 @@ class StampCutter:
 
     def reset_layout(self):
         if self.image is not None:
+            if self.boxes:
+                self._push_undo()
             try:
                 rows, cols, margin, gap = self._settings()
                 w, h = self.image.size
@@ -152,9 +564,102 @@ class StampCutter:
                 self.active_box = 0
                 self.selected_number.set("1")
                 self.select_spin.configure(to=max(1, rows * cols))
+                self._layout_settings = (rows, cols, margin, gap)
+                self._boxes_customized = False
             except (ValueError, tk.TclError):
                 self.boxes = []
         self.redraw()
+
+    def check_update_clicked(self):
+        """「更新を確認」ボタン: 新しい版が出ているかだけを確認します（起動時の自動確認はしません）。
+
+        通信は別スレッドで行い、結果はキュー経由で受け取ります。
+        Tkinterの操作はメインスレッドからだけ行うための構成です。
+        """
+        import queue
+        import threading
+
+        self.update_button.configure(state="disabled", text="確認中…")
+        result_queue = queue.Queue()
+
+        def worker():
+            result_queue.put((check_for_update(), check_components()))
+
+        def poll():
+            if result_queue.empty():
+                self.root.after(100, poll)
+            else:
+                self._finish_update_check(result_queue.get())
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(100, poll)
+
+    def _finish_update_check(self, result):
+        import webbrowser
+
+        self.update_button.configure(state="normal", text="更新を確認")
+        app_result, component_results = result
+        status, _latest, url = app_result
+        body = "\n".join(_update_summary_lines(app_result, component_results))
+        comp_update = next((c for c in component_results if c[3] == "update"), None)
+        if status == "update":
+            if messagebox.askyesno("更新確認", body + "\n\nダウンロードページを開きますか？"):
+                webbrowser.open(url)
+        elif status == "error" and all(state == "error" for _n, _b, _l, state in component_results):
+            messagebox.showwarning(
+                "更新確認",
+                "更新情報を取得できませんでした。\n"
+                "インターネット接続を確認して、もう一度お試しください。",
+            )
+        elif comp_update is not None:
+            if messagebox.askyesno(
+                "更新確認",
+                body + f"\n\nPillow {comp_update[2]} をダウンロードして、次回起動から使うようにしますか？",
+            ):
+                self._start_pillow_download()
+        else:
+            messagebox.showinfo("更新確認", body)
+
+    def _start_pillow_download(self):
+        """新しい Pillow をダウンロードし、次回起動から使えるように保存します（この起動中は同梱版のまま）。"""
+        import queue
+        import threading
+
+        self.update_button.configure(state="disabled", text="ダウンロード中…")
+        result_queue = queue.Queue()
+
+        def worker():
+            try:
+                result_queue.put(("ok", download_latest_pillow()))
+            except Exception:
+                result_queue.put(("error", ""))
+
+        def poll():
+            if result_queue.empty():
+                self.root.after(150, poll)
+                return
+            kind, version = result_queue.get()
+            self.update_button.configure(state="normal", text="更新を確認")
+            if kind == "ok":
+                if messagebox.askyesno(
+                    "ダウンロード完了",
+                    f"Pillow {version} をダウンロードしました。\n次回起動から新しい Pillow を使います。\n\n今すぐアプリを再起動しますか？",
+                ):
+                    self._restart_app()
+            else:
+                messagebox.showwarning(
+                    "ダウンロード失敗",
+                    "Pillow のダウンロードに失敗しました。\nインターネット接続を確認して、もう一度お試しください。",
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(150, poll)
+
+    def _restart_app(self):
+        import subprocess
+
+        subprocess.Popen([sys.executable] + sys.argv[1:])
+        self.root.destroy()
 
     def open_image(self):
         path = filedialog.askopenfilename(title="スタンプシートを選択", filetypes=[("画像ファイル", "*.png *.webp *.jpg *.jpeg *.bmp"), ("すべてのファイル", "*.*")])
@@ -167,6 +672,7 @@ class StampCutter:
             return
         self.image, self.image_path = img, Path(path)
         self.file_label.configure(text=f"{self.image_path.name}  ({img.width} × {img.height}px)")
+        self._undo_stack.clear()
         self.reset_layout()
 
     def _mousewheel(self, event):
@@ -178,6 +684,8 @@ class StampCutter:
         self.canvas.delete("all")
         if self.image is None:
             self.info.configure(text="")
+            if hasattr(self, "selected_info"):
+                self.selected_info.configure(text="")
             return
         try:
             rows, cols, _margin, _gap = self._settings()
@@ -206,11 +714,27 @@ class StampCutter:
             px2, py2 = x0 + x2 * sx, y0 + y2 * sy
             color, width = ("#ffdc45", 3) if i == self.active_box else ("#9b9b9b", 1)
             self.canvas.create_rectangle(px1, py1, px2, py2, outline=color, width=width)
+            if i == self.active_box:
+                edge_points = {
+                    "左辺": (px1, py1, px1, py2),
+                    "右辺": (px2, py1, px2, py2),
+                    "上辺": (px1, py1, px2, py1),
+                    "下辺": (px1, py2, px2, py2),
+                }[self.edge_var.get()]
+                self.canvas.create_line(*edge_points, fill="#ff5252", width=3)
             self.canvas.create_text(px1 + 5, py1 + 4, text=str(i + 1), fill=color, anchor="nw", font=("Segoe UI", 10, "bold"))
             iw, ih = round(x2 - x1), round(y2 - y1)
-            dim_lines.append(f"{i + 1}:{iw}×{ih}")
+            entry = f"{i + 1}:{iw}×{ih}"
+            if iw > 370 or ih > 320:
+                entry += "⚠"
+            if i == self.active_box:
+                entry = f"【{entry}】"
+            dim_lines.append(entry)
             oversized = oversized or iw > 370 or ih > 320
         self.info.configure(text=f"各コマのサイズ(px): " + "  /  ".join(dim_lines), wraplength=max(500, cw - 24))
+        if hasattr(self, "selected_info") and 0 <= self.active_box < len(self.boxes):
+            ax1, ay1, ax2, ay2 = self.boxes[self.active_box]
+            self.selected_info.configure(text=f"コマ{self.active_box + 1}: {round(ax2 - ax1)}×{round(ay2 - ay1)}px")
         self.warning.configure(text="⚠ スタンプ本体の上限（370×320px）を超えるコマがあります" if oversized else "")
         self.canvas.configure(scrollregion=(0, 0, size[0], size[1]))
 
@@ -236,6 +760,8 @@ class StampCutter:
             self.active_box = i
             self.selected_number.set(str(i + 1))
             self.drag_target = (i, edge)
+            self._push_undo()
+            self.canvas.focus_set()
             self.redraw()
             self.drag_line(event)
             return
@@ -244,6 +770,7 @@ class StampCutter:
                 self.active_box = i
                 self.selected_number.set(str(i + 1))
                 self.drag_target = None
+                self.canvas.focus_set()
                 self.redraw()
                 return
         self.drag_target = None
@@ -256,13 +783,17 @@ class StampCutter:
         except ValueError:
             messagebox.showerror("移動量を確認してください", "移動量は1以上の整数を入力してください。")
             return
+        self._push_undo()
         box = self.boxes[self.active_box]
         edge = self.edge_var.get()
         index = {"左辺": 0, "上辺": 1, "右辺": 2, "下辺": 3}[edge]
         limit = self.image.width if index in (0, 2) else self.image.height
         other = {0: 2, 2: 0, 1: 3, 3: 1}[index]
         minimum, maximum = (0, box[other] - 1) if index in (0, 1) else (box[other] + 1, limit)
-        box[index] = max(minimum, min(box[index] + step, maximum))
+        # ＋は辺を外側へ（枠が広がる方向）、−は内側へ。左辺・上辺は座標が減る方が外側
+        outward = 1 if index in (2, 3) else -1
+        box[index] = max(minimum, min(box[index] + step * outward, maximum))
+        self._boxes_customized = True
         self.redraw()
 
     def drag_line(self, event):
@@ -270,7 +801,7 @@ class StampCutter:
             return
         i, edge = self.drag_target
         ix, iy = self._image_point(event)
-        if self.drag_mode.get() == "all":
+        if event.state & 0x0001:  # Shift同時押しのときだけ全コマをまとめて動かす
             axis = 0 if edge.startswith("x") else 1
             target = ix if axis == 0 else iy
             old = self.boxes[i][0 if edge == "x1" else 2] if axis == 0 else self.boxes[i][1 if edge == "y1" else 3]
@@ -292,6 +823,7 @@ class StampCutter:
                 box[1] = max(0, min(round(iy), round(box[3]) - 1))
             else:
                 box[3] = min(self.image.height, max(round(iy), round(box[1]) + 1))
+        self._boxes_customized = True
         self.redraw()
 
     def _edge_checkerboard_colors(self):
@@ -445,6 +977,8 @@ class StampCutter:
                 bounds[i][2] = max(bounds[i][2], x2)
                 bounds[i][3] = max(bounds[i][3], y2)
 
+        self._push_undo()
+        self._boxes_customized = True
         adjusted = 0
         for i, box in enumerate(bounds):
             if box is None:
@@ -574,7 +1108,68 @@ class StampCutter:
             messagebox.showwarning("書き出しの確認", "\n".join(details + output_warnings))
         else:
             messagebox.showinfo("完了", "\n".join(details + ["PNG・72dpiで保存しました。\n" + str(folder)]))
+def _bundled_versions_text():
+    import platform
+    from importlib.util import find_spec
+
+    import PIL
+
+    if find_spec("numpy") is not None:
+        import numpy
+
+        numpy_state = numpy.__version__
+    else:
+        numpy_state = "同梱されていません"
+    return "\n".join(
+        [
+            f"{APP_TITLE} {APP_VERSION}",
+            f"Python: {platform.python_version()}",
+            f"Pillow: {PIL.__version__}（{'ダウンロード版を使用中' if _PILLOW_FROM_DOWNLOAD else '同梱'}）",
+            f"NumPy: {numpy_state}",
+            f"Tk: {tk.TkVersion}",
+        ]
+    )
+
+
+def _print_or_show(text, title="バージョン情報"):
+    """コンソールに出せる場合は表示し、Windowsの画面アプリ用EXEなど出せない場合はダイアログで表示します。"""
+    import sys
+
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        print(text)
+        return
+    # Windowsの --windowed EXEはコンソールを持たないため、起動元の
+    # コマンドプロンプトへの接続を試み、それもできない場合はダイアログで表示する
+    try:
+        import ctypes
+
+        if ctypes.windll.kernel32.AttachConsole(-1):
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            print(text)
+            return
+    except Exception:
+        pass
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showinfo(title, text)
+    root.destroy()
+
+
+def _show_versions():
+    """--versions 指定時: 同梱物の版数を表示して終了する（通常画面は開かない）。"""
+    _print_or_show(_bundled_versions_text())
+
+
 if __name__ == "__main__":
+    import sys
+
+    if any(arg in ("--version", "--versions") for arg in sys.argv[1:]):
+        _show_versions()
+        sys.exit(0)
+    if "--check-components" in sys.argv[1:]:
+        summary = "\n".join(_update_summary_lines(check_for_update(), check_components()))
+        _print_or_show(summary, title="更新確認")
+        sys.exit(0)
     root = tk.Tk()
     StampCutter(root)
     root.mainloop()
